@@ -1,0 +1,13 @@
+{
+  "name": "consent-audit",
+  "description": "Privacy/consent auditing tools: three-state PECR/GDPR banner audits and server-side device-fingerprint detection.",
+  "owner": { "name": "Thihal", "email": "5278519+Thihal@users.noreply.github.com" },
+  "plugins": [
+    {
+      "name": "consent-audit",
+      "source": "./",
+      "description": "Audit web consent banners and detect server-side device fingerprinting.",
+      "repository": "https://github.com/Thihal/consent-audit"
+    }
+  ]
+}

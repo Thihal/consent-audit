@@ -1,0 +1,27 @@
+{
+  "description": "Synthetic device_id cookie values illustrating the byte-identical persistent_id pattern across three fully isolated browser contexts. The persistent_id 'Zx7Qp2Lm9Kd4Rt1Vb8N' is identical across two distinct domains and three independent contexts -- the signature of server-side re-identification. Values are fabricated for testing, not captured from any real site.",
+  "method": "Three Playwright BrowserContext instances, each fresh (no shared cookies, storage, or in-memory state). Identity cookies captured after clicking the reject-equivalent on each site's consent banner.",
+  "captures": [
+    {
+      "context": "A",
+      "domain": "www.example.com",
+      "cookie_value": "refresh=1700000000000&id=11111111-1111-4111-8111-111111111111:id=Zx7Qp2Lm9Kd4Rt1Vb8N&cacheExpiry=1700003600&requestId=1700000000001.aaaaaa&confidenceScore=0.82",
+      "expected_persistent_id": "Zx7Qp2Lm9Kd4Rt1Vb8N",
+      "expected_confidence": 0.82
+    },
+    {
+      "context": "B",
+      "domain": "www.example.com",
+      "cookie_value": "refresh=1700000050000&id=22222222-2222-4222-8222-222222222222:id=Zx7Qp2Lm9Kd4Rt1Vb8N&cacheExpiry=1700003650&requestId=1700000050001.bbbbbb&confidenceScore=0.82",
+      "expected_persistent_id": "Zx7Qp2Lm9Kd4Rt1Vb8N",
+      "expected_confidence": 0.82
+    },
+    {
+      "context": "C",
+      "domain": "www.example.org",
+      "cookie_value": "refresh=1700000090000&id=33333333-3333-4333-8333-333333333333:id=Zx7Qp2Lm9Kd4Rt1Vb8N&cacheExpiry=1700003690&requestId=1700000090001.cccccc&confidenceScore=0.82",
+      "expected_persistent_id": "Zx7Qp2Lm9Kd4Rt1Vb8N",
+      "expected_confidence": 0.82
+    }
+  ]
+}

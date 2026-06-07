@@ -1,0 +1,9 @@
+url: https://www.example.com
+accept_selector: "#accept-all-cookies"
+reject_selector: "#reject-all-cookies"
+consent_cookie: CookieConsent
+identity_cookies:
+  - device_id
+  - _ga
+  - _fbp
+settle_seconds: 4.0

@@ -1,0 +1,10 @@
+{
+  "name": "consent-audit",
+  "displayName": "Consent Audit",
+  "version": "0.1.0",
+  "description": "Audit web consent banners (PECR/GDPR) and detect server-side device-fingerprint re-identification across isolated browser contexts.",
+  "author": { "name": "Thihal", "email": "5278519+Thihal@users.noreply.github.com" },
+  "repository": "https://github.com/Thihal/consent-audit",
+  "license": "MIT",
+  "keywords": ["privacy", "consent", "gdpr", "pecr", "fingerprinting", "playwright", "security"]
+}
