@@ -7,6 +7,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 
 from .audit import FingerprintAudit, SiteAudit, StateSnapshot
+from .detect import Provenance
 
 
 def audit_to_json(audit: SiteAudit) -> str:
@@ -103,6 +104,16 @@ def _ico_checklist(audit: SiteAudit) -> list[str]:
     reject_button_worked = reject.button_clicked is True
     banner_exercised = accept_button_worked and reject_button_worked
 
+    # Reject-dependent obligations ([R6], [R10], [R11-after-reject]) can only be judged if
+    # reject was actually exercised. Otherwise mark them n/a — a ✓ would falsely clear the
+    # site and a ✗ would falsely accuse it, when in truth the experiment never ran. The
+    # [R4] reachability row is also n/a when detection was inconclusive (banner unreadable)
+    # but a real ✗ when a banner was read and offered no one-click reject (NOT_FOUND).
+    det = audit.detection
+    reject_prov = det.reject_provenance if det else Provenance.MANUAL
+    reject_inconclusive = reject_prov == Provenance.INCONCLUSIVE
+    reject_assessable = reject_button_worked
+
     suspicious_storage_count = len(noaction.suspicious_storage_keys)
 
     def mark(ok: bool, *, na: bool = False) -> str:
@@ -130,17 +141,23 @@ def _ico_checklist(audit: SiteAudit) -> list[str]:
         f"{mark(len(pre_consent_tracker_hosts) == 0)} | "
         f"{noaction.host_count} unique hosts; "
         f"{len(pre_consent_tracker_hosts)} known-tracker / first-party-masked hosts |",
-        f"| [R4] Reject mechanism reachable in one click | {mark(reject_button_worked)} | "
-        f"reject_selector {'matched' if reject_button_worked else 'did not match'} an element |",
+        f"| [R4] Reject mechanism reachable in one click | "
+        f"{mark(reject_button_worked, na=reject_inconclusive)} | "
+        + ("reject button not auto-detectable — inconclusive" if reject_inconclusive
+           else f"reject button {'matched' if reject_button_worked else 'not found / did not match'}")
+        + " |",
         f"| [R6] Only strictly-necessary cookies after Reject | "
-        f"{mark(non_essential_post_reject == 0)} | "
-        f"{non_essential_post_reject} unique non-essential cookies still present after Reject |",
+        f"{mark(non_essential_post_reject == 0, na=not reject_assessable)} | "
+        + (f"{non_essential_post_reject} unique non-essential cookies still present after Reject"
+           if reject_assessable else "reject not exercised — not assessed") + " |",
         f"| [R10] Cookie lifetimes appropriate (≤1 year for non-essential) | "
-        f"{mark(long_lived_post_reject == 0)} | "
-        f"{long_lived_post_reject} unique non-essential cookies exceed 1 year after Reject |",
+        f"{mark(long_lived_post_reject == 0, na=not reject_assessable)} | "
+        + (f"{long_lived_post_reject} unique non-essential cookies exceed 1 year after Reject"
+           if reject_assessable else "reject not exercised — not assessed") + " |",
         f"| [R11] Third-party cookie use disclosed and minimised | "
-        f"{mark(third_party_post_reject == 0)} | "
-        f"{third_party_post_reject} unique third-party cookies after Reject |",
+        f"{mark(third_party_post_reject == 0, na=not reject_assessable)} | "
+        + (f"{third_party_post_reject} unique third-party cookies after Reject"
+           if reject_assessable else "reject not exercised — not assessed") + " |",
         f"| [R13] No identifier-like storage set before consent | "
         f"{mark(suspicious_storage_count == 0)} | "
         f"{suspicious_storage_count} identifier-like keys "
@@ -171,6 +188,28 @@ def audit_to_markdown(audit: SiteAudit) -> str:
         "",
     ]
 
+    if audit.detection is not None:
+        d = audit.detection
+        acc = f"`{d.accept_selector}`" if d.accept_selector else "_(not found)_"
+        rej = f"`{d.reject_selector}`" if d.reject_selector else "_(not found)_"
+        lines += [
+            "## Consent-button detection",
+            "",
+            "Selectors were auto-detected. Recorded here so the run is reproducible — paste "
+            "a selector into DevTools to confirm it resolves to the button described.",
+            "",
+            "| Field | Value |",
+            "|---|---|",
+            f"| CMP | {d.cmp or '_(none identified)_'} |",
+            f"| Accept selector | {acc} ({d.accept_provenance.value}) |",
+            f"| Reject selector | {rej} ({d.reject_provenance.value}) |",
+            "",
+        ]
+        if d.notes:
+            for n in d.notes:
+                lines.append(f"> {n}")
+            lines.append("")
+
     if audit.findings:
         lines.append("## Findings")
         lines.append("")
@@ -200,12 +239,72 @@ def audit_to_markdown(audit: SiteAudit) -> str:
     return "\n".join(lines)
 
 
+def _has_tag(audit: SiteAudit, tag: str) -> bool:
+    return any(f.startswith(tag) for f in audit.findings)
+
+
+def scan_summary_to_markdown(audits: list[SiteAudit]) -> str:
+    """One-row-per-site overview for a batch scan. The headline a regulator triages on:
+    which sites keep tracking after reject, which offer no reject, which were inconclusive."""
+    lines = [
+        f"# Consent scan summary — {len(audits)} sites",
+        "",
+        f"**Generated:** {datetime.now(UTC).isoformat(timespec='seconds')}",
+        "",
+        "Per-site headline. `✗ reject` = non-essential cookies survived a reject click "
+        "([R6]); `no reject` = banner offered no one-click refusal ([R4]); `inconclusive` "
+        "= the banner could not be auto-read (tool limitation, not a verdict). See each "
+        "site's own report for the full ICO Reg 6 checklist and cookie inventory.",
+        "",
+        "| Site | CMP | Pre-consent trackers [R1] | Reject honoured | Notes |",
+        "|---|---|---|---|---|",
+    ]
+    for a in audits:
+        det = a.detection
+        prov = det.reject_provenance if det else Provenance.MANUAL
+        r1 = "✗" if (_has_tag(a, "[R1]")) else "✓"
+        if prov == Provenance.INCONCLUSIVE:
+            reject_col = "inconclusive"
+        elif prov == Provenance.NOT_FOUND:
+            reject_col = "no reject offered"
+        elif _has_tag(a, "[R6]"):
+            reject_col = "✗ tracks after reject"
+        else:
+            reject_col = "✓"
+        note = (det.cmp or "") if det else ""
+        if det and det.notes:
+            note = (note + " — " if note else "") + det.notes[0]
+        lines.append(f"| {a.site} | {(det.cmp if det and det.cmp else '—')} | {r1} | {reject_col} | {note} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def scan_summary_to_json(audits: list[SiteAudit]) -> str:
+    rows = []
+    for a in audits:
+        det = a.detection
+        rows.append({
+            "site": a.site,
+            "url": a.url,
+            "cmp": det.cmp if det else None,
+            "reject_provenance": (det.reject_provenance.value if det else "manual"),
+            "findings": a.findings,
+        })
+    return json.dumps({"generated_at": datetime.now(UTC).isoformat(), "sites": rows}, indent=2)
+
+
 def fingerprint_to_markdown(audit: FingerprintAudit) -> str:
     lines = [
         f"# Fingerprint persistence — {audit.url}",
         "",
         f"**Isolated contexts tested:** {audit.contexts}",
         f"**Generated:** {datetime.now(UTC).isoformat(timespec='seconds')}",
+    ]
+    if audit.pre_click_selector or audit.pre_click_provenance:
+        prov = f" ({audit.pre_click_provenance})" if audit.pre_click_provenance else ""
+        clicked = f"`{audit.pre_click_selector}`" if audit.pre_click_selector else "_(none — reject not clicked)_"
+        lines.append(f"**Reject clicked before capture:** {clicked}{prov}")
+    lines += [
         "",
         "Two or more fully isolated browser contexts share no cookies, storage, or",
         "in-memory state. A persistent identifier that repeats across them can only",

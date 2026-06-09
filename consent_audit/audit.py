@@ -11,7 +11,14 @@ from urllib.parse import urlparse
 import yaml
 from pydantic import BaseModel, Field
 
-from .browser import capture_state, click_if_present, with_fresh_context
+from .browser import (
+    await_device_identity,
+    capture_state,
+    click_if_present,
+    detect_for_url,
+    with_fresh_context,
+)
+from .detect import Detection, Provenance
 from .parse import (
     classify_cookie,
     classify_host,
@@ -33,8 +40,10 @@ LONG_LIFETIME_DAYS = 365.0
 
 class SiteConfig(BaseModel):
     url: str
-    accept_selector: str
-    reject_selector: str
+    # Optional so a config can be synthesised from auto-detection (consent-audit audit <url>).
+    # Hand-written YAMLs still supply both; None means "not detected / no click for this state".
+    accept_selector: str | None = None
+    reject_selector: str | None = None
     consent_cookie: str | None = None
     identity_cookies: list[str] = Field(default_factory=list)
     settle_seconds: float = 4.0
@@ -168,6 +177,10 @@ class SiteAudit:
     accept: StateSnapshot
     reject: StateSnapshot
     findings: list[str] = field(default_factory=list)
+    # Present when selectors were auto-detected; None for hand-written-YAML runs (treated
+    # as MANUAL provenance). Drives how analyse() distinguishes a real reject-not-offered
+    # finding from a banner the detector simply could not read.
+    detection: Detection | None = None
 
     def analyse(self) -> None:
         """Generate human-readable findings based on the three captured states.
@@ -190,19 +203,40 @@ class SiteAudit:
         site_host = urlparse(self.url).hostname or ""
         accept_failed = self.accept.button_clicked is False
         reject_failed = self.reject.button_clicked is False
+        reject_clicked = self.reject.button_clicked is True
+
+        # Detection provenance (auto-mode only). MANUAL when selectors came from YAML.
+        det = self.detection
+        reject_prov = det.reject_provenance if det else Provenance.MANUAL
+        reject_inconclusive = reject_prov == Provenance.INCONCLUSIVE
 
         # [AUDIT] Page-didn't-load-normally warning. When neither consent button matched,
         # the captured state may be a bot challenge / Cloudflare interstitial / unrendered
         # CMP rather than the real site — and the rest of the findings will look ✓ by
         # default. Prepend this so the reader sees the caveat before the green markers.
-        if accept_failed and reject_failed:
+        if accept_failed and reject_failed and not reject_inconclusive:
             self.findings.append(
-                "[AUDIT] Neither accept_selector nor reject_selector matched any element "
+                "[AUDIT] Neither accept nor reject button matched any element "
                 "— the captured state may reflect a bot-challenge page or an unrendered "
                 f"consent banner rather than the real site (accept state: "
                 f"{self.accept.cookie_count} cookies, {self.accept.host_count} hosts). "
                 "Treat ✓ markers below with caution."
             )
+
+        # [AUDIT] Auto-detection could not read the banner at all (no known CMP, no
+        # matchable accept/reject control, or an iframe-hosted CMP). This is a *tool
+        # limitation*, not a finding about the site: the reject experiment never ran, so
+        # nothing below speaks to whether reject is honoured. Kept distinct from the
+        # not-found case (banner readable, no one-click reject) which IS a [R4] finding.
+        if det and (det.cmp or det.notes):
+            cmp_note = f"CMP: {det.cmp}. " if det.cmp else ""
+            if reject_inconclusive:
+                self.findings.append(
+                    f"[AUDIT] Reject button could not be auto-detected. {cmp_note}"
+                    + " ".join(det.notes)
+                    + " INCONCLUSIVE: the reject experiment did not run — this is neither "
+                    "evidence of compliance nor of a breach. Re-run with a manual YAML."
+                )
 
         # [R1] Pre-consent third-party tracker host contact.
         pre_consent_third_party = [
@@ -229,15 +263,27 @@ class SiteAudit:
                 + ", ".join(noaction_non_essential_names)
             )
 
-        # [R4] Accept and reject button reachability. Either failing-to-match is a
-        # finding: accept failing means the page may not be in the expected state for
-        # the accept-state comparison; reject failing is a direct consent-UX problem.
+        # [R4] Accept reachability. A failed accept click means the page may not be in the
+        # expected state for the accept-state comparison.
         if accept_failed:
             self.findings.append(
-                "[R4] Configured accept selector did not match an element on the page — "
+                "[R4] Accept button did not match an element on the page — "
                 "the accept-state capture may not reflect a real consent decision"
             )
-        if reject_failed:
+
+        # [R4] Reject reachability. The reading depends on provenance:
+        #   - NOT_FOUND: a banner was readable but offered no one-click reject/essential-only
+        #     control — a genuine consent-UX finding against the site.
+        #   - MANUAL and the selector failed: the hand-written selector is stale or wrong.
+        #   - INCONCLUSIVE: already reported above as a tool limitation, not repeated here.
+        if reject_prov == Provenance.NOT_FOUND:
+            self.findings.append(
+                "[R4] No one-click reject (or 'essential only') button was found on the "
+                "banner — freely-given consent requires refusal be as easy as acceptance. "
+                "If reject is behind a 'Manage preferences' layer, that multi-step burden "
+                "is itself the concern; capture it with a manual YAML to test what survives."
+            )
+        elif reject_failed and not reject_inconclusive and reject_prov == Provenance.MANUAL:
             self.findings.append(
                 "[R4] Configured reject selector did not match an element on the page — "
                 "verify the banner provides a clearly-labelled reject mechanism reachable "
@@ -247,15 +293,19 @@ class SiteAudit:
         # [R6] Non-essential cookies surviving the reject click. Reg 6 exemptions are
         # narrow: communication transmission, or strictly-necessary for a user-requested
         # service. Analytics, ads, behavioural tracking, session replay never qualify.
-        post_reject_non_essential_names = sorted({
-            c.name for c in self.reject.non_essential_cookies
-        })
-        if post_reject_non_essential_names:
-            self.findings.append(
-                f"[R6] Non-essential cookies still set after Reject "
-                f"({len(post_reject_non_essential_names)}): "
-                + ", ".join(post_reject_non_essential_names)
-            )
+        # Only assessed when reject was actually exercised — without a real reject click
+        # the reject-state cookies are just the pre-consent set, and reporting them as
+        # "surviving reject" would manufacture a finding the experiment never tested.
+        if reject_clicked:
+            post_reject_non_essential_names = sorted({
+                c.name for c in self.reject.non_essential_cookies
+            })
+            if post_reject_non_essential_names:
+                self.findings.append(
+                    f"[R6] Non-essential cookies still set after Reject "
+                    f"({len(post_reject_non_essential_names)}): "
+                    + ", ".join(post_reject_non_essential_names)
+                )
 
         # [R10] Long-lived cookies. Surface anything > 1 year, especially non-essential.
         # Cookies with the same name on multiple domains are distinct records; include
@@ -263,7 +313,7 @@ class SiteAudit:
         long_lived_non_essential = [
             c for c in self.reject.long_lived_cookies
             if c.classification == "non-essential"
-        ]
+        ] if reject_clicked else []
         if long_lived_non_essential:
             sorted_records = sorted(
                 long_lived_non_essential, key=lambda c: -(c.lifetime_days or 0)
@@ -292,7 +342,7 @@ class SiteAudit:
         # classification, catches vendors not in our pattern list.
         third_party_after_reject_names = sorted({
             c.name for c in self.reject.third_party_cookies
-        })
+        }) if reject_clicked else []
         if third_party_after_reject_names:
             self.findings.append(
                 f"[R11] Third-party cookies remain after Reject "
@@ -348,17 +398,23 @@ class FingerprintAudit:
     contexts: int
     raw_values: list[str]  # raw cookie values, one per context
     findings: list[FingerprintFinding]
+    # Recorded for reproducibility when the test was run zero-config: which reject button
+    # was clicked before capture, and how that selector was obtained.
+    pre_click_selector: str | None = None
+    pre_click_provenance: str | None = None
 
 
 # ---------- Three-state audit ----------
 
-async def _capture_with_button(
-    cfg: SiteConfig, selector: str | None, site_host: str
+async def _capture_state(
+    cfg: SiteConfig, state: str, selector: str | None, site_host: str
 ) -> StateSnapshot:
-    """Open a fresh context, optionally click a selector, return snapshot.
+    """Open a fresh context, optionally click `selector`, return snapshot.
 
-    Records whether the click actually matched an element (button_clicked); this is the
-    [R4] signal that the reject mechanism is reachable as configured.
+    State is passed explicitly (not inferred from the selector) so that a `None` selector
+    on the accept/reject states — meaning "not detected, nothing to click" — is not
+    mistaken for the noaction state. Records whether the click matched an element
+    (button_clicked); this is the [R4] signal that the consent button was reachable.
     """
     click_result: dict[str, bool] = {"clicked": False}
 
@@ -372,25 +428,39 @@ async def _capture_with_button(
         return await capture_state(page)
 
     raw = await with_fresh_context(callback=cb, url=cfg.url)
-    state = "noaction" if selector is None else (
-        "accept" if selector == cfg.accept_selector else "reject"
-    )
-    button_clicked = None if selector is None else click_result["clicked"]
+    button_clicked = None if state == "noaction" else click_result["clicked"]
     return StateSnapshot.from_raw(state, raw, site_host=site_host, button_clicked=button_clicked)
 
 
-async def run_three_state_audit(cfg: SiteConfig) -> SiteAudit:
+async def run_three_state_audit(
+    cfg: SiteConfig, detection: Detection | None = None
+) -> SiteAudit:
     site_host = urlparse(cfg.url).hostname or ""
-    noaction = await _capture_with_button(cfg, selector=None, site_host=site_host)
-    accept = await _capture_with_button(cfg, selector=cfg.accept_selector, site_host=site_host)
-    reject = await _capture_with_button(cfg, selector=cfg.reject_selector, site_host=site_host)
+    noaction = await _capture_state(cfg, "noaction", None, site_host)
+    accept = await _capture_state(cfg, "accept", cfg.accept_selector or None, site_host)
+    reject = await _capture_state(cfg, "reject", cfg.reject_selector or None, site_host)
 
     audit = SiteAudit(
         site=site_host, url=cfg.url,
         noaction=noaction, accept=accept, reject=reject,
+        detection=detection,
     )
     audit.analyse()
     return audit
+
+
+async def audit_url(url: str, settle_seconds: float = 4.0) -> SiteAudit:
+    """Zero-config audit: detect the consent buttons on `url`, then run the three-state
+    audit using the detected selectors. The Detection (CMP, selectors, provenance) is
+    attached to the result so the run is reproducible evidence."""
+    detection = await detect_for_url(url, settle_seconds=settle_seconds)
+    cfg = SiteConfig(
+        url=url,
+        accept_selector=detection.accept_selector,
+        reject_selector=detection.reject_selector,
+        settle_seconds=settle_seconds,
+    )
+    return await run_three_state_audit(cfg, detection=detection)
 
 
 # ---------- Fingerprint persistence test ----------
@@ -401,20 +471,26 @@ async def run_fingerprint_persistence_test(
     *,
     contexts: int = 3,
     pre_click_selector: str | None = None,
+    settle_seconds: float = 4.0,
 ) -> FingerprintAudit:
     """
     Open N fully isolated browser contexts, optionally click a reject button,
     capture identity cookie values, and report whether any persistent identifier
     repeats across contexts (only possible via server-side fingerprinting).
+
+    After the reject click + settle, each context also waits for any tracked device-id
+    cookie to receive its asynchronously-written persistent component before capturing,
+    so the server-side identity upgrade is not raced (which would false-negative).
     """
     cookies_per_context: list[dict[str, str]] = []
 
     for _ in range(contexts):
         async def cb(page):  # type: ignore[no-untyped-def]
             if pre_click_selector:
-                await click_if_present(page, pre_click_selector)
+                await click_if_present(page, pre_click_selector, settle_seconds=settle_seconds)
             else:
-                await asyncio.sleep(4.0)
+                await asyncio.sleep(settle_seconds)
+            await await_device_identity(page, identity_cookies)
             return await capture_state(page)
 
         raw = await with_fresh_context(callback=cb, url=url)
@@ -429,17 +505,23 @@ async def run_fingerprint_persistence_test(
         persistent_ids: list[str] = []
         confidences: list[float | None] = []
         for v in values:
-            if cookie_name == "device_id":
-                p = parse_device_id_cookie(v) if v else None
-                persistent_ids.append(p.persistent_id or "" if p else "")
-                confidences.append(p.confidence_score if p else None)
-            elif cookie_name == "_ga" or cookie_name.startswith("_ga_"):
+            if cookie_name == "_ga" or cookie_name.startswith("_ga_"):
                 p = parse_ga4(cookie_name, v) if v else None
                 persistent_ids.append(p.persistent_id or "" if p else "")
                 confidences.append(None)
             else:
-                persistent_ids.append(v)
-                confidences.append(None)
+                # Format-driven, not name-driven: any cookie carrying the generic
+                # server-side device-id shape (inner ":id=<persistent>") has a stable
+                # component that survives while the outer session token rotates. Comparing
+                # the whole value would false-negative on exactly the cookies we care about
+                # (e.g. rvu_device_id). Fall back to the whole value when the shape is absent.
+                p = parse_device_id_cookie(v) if v else None
+                if p and p.persistent_id:
+                    persistent_ids.append(p.persistent_id)
+                    confidences.append(p.confidence_score)
+                else:
+                    persistent_ids.append(v)
+                    confidences.append(None)
 
         unique_ids = {pid for pid in persistent_ids if pid}
         is_persistent = len(unique_ids) == 1 and len(persistent_ids) > 1 and all(persistent_ids)
@@ -453,7 +535,64 @@ async def run_fingerprint_persistence_test(
 
     return FingerprintAudit(
         url=url, contexts=contexts, raw_values=raw_values, findings=findings,
+        pre_click_selector=pre_click_selector,
     )
+
+
+async def discover_identity_cookies(
+    url: str, *, pre_click_selector: str | None, settle_seconds: float = 4.0
+) -> list[str]:
+    """Open one reject context and pick the cookies worth tracking for fingerprinting:
+    those that survive a reject and are either non-essential or identifier-like by name.
+    These are the candidates a human would hand to `-c`; doing it automatically is what
+    makes the fingerprint test zero-config."""
+    async def cb(page):  # type: ignore[no-untyped-def]
+        if pre_click_selector:
+            await click_if_present(page, pre_click_selector, settle_seconds=settle_seconds)
+        else:
+            await asyncio.sleep(settle_seconds)
+        return await capture_state(page)
+
+    raw = await with_fresh_context(callback=cb, url=url)
+    site_host = urlparse(url).hostname or ""
+    out: list[str] = []
+    seen: set[str] = set()
+    for c in raw.get("cookie_records", []):
+        rec = CookieRecord.from_raw(c, site_host)
+        if rec.name in seen:
+            continue
+        if rec.classification == "non-essential" or looks_identifier_like(rec.name):
+            seen.add(rec.name)
+            out.append(rec.name)
+    return out
+
+
+async def fingerprint_url(
+    url: str,
+    *,
+    contexts: int = 3,
+    settle_seconds: float = 4.0,
+    identity_cookies: list[str] | None = None,
+    pre_click_selector: str | None = None,
+) -> FingerprintAudit:
+    """Zero-config fingerprint test. Auto-detects the reject button to click before capture
+    and auto-discovers the identity cookies to track, unless either is supplied explicitly.
+    Records the reject selector and its provenance on the result for reproducibility."""
+    provenance: str | None = "manual" if pre_click_selector else None
+    if pre_click_selector is None:
+        detection = await detect_for_url(url, settle_seconds=settle_seconds)
+        pre_click_selector = detection.reject_selector
+        provenance = detection.reject_provenance.value
+    if not identity_cookies:
+        identity_cookies = await discover_identity_cookies(
+            url, pre_click_selector=pre_click_selector, settle_seconds=settle_seconds
+        )
+    result = await run_fingerprint_persistence_test(
+        url, identity_cookies, contexts=contexts,
+        pre_click_selector=pre_click_selector, settle_seconds=settle_seconds,
+    )
+    result.pre_click_provenance = provenance
+    return result
 
 
 __all__ = [
@@ -463,6 +602,9 @@ __all__ = [
     "FingerprintFinding",
     "FingerprintAudit",
     "run_three_state_audit",
+    "audit_url",
     "run_fingerprint_persistence_test",
+    "fingerprint_url",
+    "discover_identity_cookies",
     "parse_consentmgr",
 ]

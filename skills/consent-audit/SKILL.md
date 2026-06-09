@@ -65,9 +65,30 @@ If a later run reports the command is missing, the venv was wiped (e.g. a major 
 re-run the three setup lines above. Reports are written to `reports/` under the current working
 directory (the user's project), not the plugin dir.
 
-## Adding a new site
+## Auto-detection (default path)
 
-Three-state audits read a per-site YAML config. Bundled examples live in
+`$CA audit <url>` detects the Accept-all and Reject-all buttons automatically, so most
+sites need no YAML. Detection is recorded in the report (CMP, exact selectors, confidence)
+for reproducibility. How it decides, and how to read the result:
+
+- **Known CMP** (OneTrust, Cookiebot, Didomi, Usercentrics, Osano, CookieYes, Complianz):
+  matched by documented button IDs — `cmp_signature` provenance, high confidence.
+- **Generic**: word-boundary match on button labels ("Reject all", "Essential only") —
+  `generic_text` provenance, medium confidence.
+- **`not_found` for reject**: a banner was readable but offered no one-click reject. This
+  is a real **[R4]** finding against the site (reject likely behind a Manage-preferences
+  layer). The reject experiment does not run; [R6]/[R10]/[R11]-after-reject are correctly
+  *not* asserted (asserting them without a real reject click would manufacture findings).
+- **`inconclusive`**: the banner could not be read at all (iframe-hosted CMP like
+  Sourcepoint/Quantcast or TrustArc, shadow DOM, or no banner). This is a **tool
+  limitation, not a verdict** — re-run with a manual YAML. The report says so explicitly.
+
+When auto-detection returns `not_found`/`inconclusive` for a site you need to assess,
+fall through to a hand-written config below.
+
+## Adding a new site (fallback for banners auto-detection can't read)
+
+Three-state audits also accept a per-site YAML config. Bundled examples live in
 `${CLAUDE_PLUGIN_ROOT}/sites/`; write new configs anywhere convenient (e.g. a `sites/` dir in
 the user's project) and pass the path to `$CA audit`. The schema:
 
@@ -83,7 +104,8 @@ settle_seconds: 4.0                       # wait after click for trackers to fir
 
 ### Finding the selectors
 
-There is no auto-detection. Get the selectors manually:
+For the manual fallback, get the selectors yourself (auto-detection already handles the
+common cases — only reach here when it reported `not_found`/`inconclusive`):
 
 1. Open the site in a real browser.
 2. Open DevTools → Elements, find the banner.
@@ -98,15 +120,29 @@ The default 4.0 is usually fine. Increase to 6–8 for sites with lazy-loaded GT
 ## Running
 
 ```bash
-# three-state audit, writes reports/<stem>.{json,md}
+# zero-config three-state audit: pass a URL, consent buttons are auto-detected
+"$CA" audit https://www.example.com         # → reports/www.example.com.{json,md}
+
+# batch-scan many URLs; writes a per-site report each plus reports/scan-summary.{json,md}
+"$CA" scan https://a.com https://b.com
+"$CA" scan --from-file urls.txt             # one URL per line, # comments ok
+
+# three-state audit from a hand-written config (fallback for banners auto-detect can't read)
 "$CA" audit "${CLAUDE_PLUGIN_ROOT}/sites/example.com.yaml"
 
 # fingerprint persistence, writes reports/<host>.fingerprint.{json,md}
-"$CA" fingerprint https://www.example.com \
-  -c <cookie_name_1> -c <cookie_name_2> \
-  --contexts 3 \
-  --pre-click '#reject-button'
+# zero-config: reject button + identity cookies auto-detected
+"$CA" fingerprint https://www.example.com
+# override either input if needed:
+"$CA" fingerprint https://www.example.com -c <cookie_name> --pre-click '#reject-button' --contexts 3
 ```
+
+Server-side identity is written **asynchronously**: a vendor sets a plain session id on
+load and *upgrades* it to the fingerprint-matched value (inner `:id=<persistent>`, often
+with a `confidenceScore`) a few seconds later. The fingerprint test waits for that upgrade
+before capturing, so a short settle does not race it into a false negative. If a cookie you
+expect to be fingerprinted shows as "not persistent" with a rotating value, raise `--settle`
+and re-run — the match may not have landed yet, or the egress IP/entropy did not trigger one.
 
 The fingerprint test takes `--contexts N` (default 3) — three is the floor for evidence; two contexts could collide by chance for a short ID, three with byte-identical values is hard to explain away.
 
@@ -190,7 +226,9 @@ installed plugin copy is replaced on update — durable changes belong in a clon
 
 Reports land in `reports/`:
 
-- `<host>.json` / `<host>.md` — three-state audit.
+- `<host>.json` / `<host>.md` — three-state audit (stem is the YAML filename for manual runs,
+  the hostname for URL runs).
+- `scan-summary.json` / `scan-summary.md` — one-row-per-site overview from `scan`.
 - `<host>.fingerprint.json` / `<host>.fingerprint.md` — fingerprint persistence.
 
 Markdown is what to show the user or paste into a writeup; JSON is what to diff between runs or feed downstream tooling.

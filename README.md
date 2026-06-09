@@ -62,26 +62,53 @@ Claude to "audit example.com" or "check if reject actually rejects on <site>".
 
 ## Run
 
-Three-state audit:
+Three-state audit — point it at a URL and the consent buttons are auto-detected (no YAML):
+
+```bash
+consent-audit audit https://www.example.com
+# → reports/www.example.com.{json,md}
+```
+
+Batch-scan many sites for a summary table plus a per-site report each:
+
+```bash
+consent-audit scan https://a.com https://b.com
+consent-audit scan --from-file sites.txt        # one URL per line, # comments ok
+# → reports/<host>.{json,md} for each, plus reports/scan-summary.{json,md}
+```
+
+Auto-detection recognises the major consent platforms (OneTrust, Cookiebot, Didomi,
+Usercentrics, Osano, CookieYes, Complianz) by their documented buttons, and falls back to
+word-boundary matching on button labels otherwise. Each report records the detected CMP,
+the exact selectors used, and the detection confidence, so a run is reproducible. It
+deliberately handles only **single-click reject-all**: multi-layer banners (Manage →
+toggle each off → Save) and iframe-hosted CMPs are reported honestly as needing a manual
+config rather than guessed at — a wrong reject button would manufacture a false finding.
+
+For those cases, pass a hand-written YAML instead of a URL (see *Adding a site*):
 
 ```bash
 consent-audit audit sites/example.com.yaml
 # → reports/example.com.{json,md}
 ```
 
-Fingerprint persistence test (three isolated contexts, click the reject button before capture):
+Fingerprint persistence test (N isolated contexts, reject clicked before capture) — also
+zero-config: the reject button and the identity cookies to track are auto-detected, and
+each context waits for any server-side device-id cookie to receive its asynchronously
+written persistent component before capturing (so the identity upgrade is not raced):
 
 ```bash
-consent-audit fingerprint https://www.example.com \
-  -c device_id -c _ga \
-  --contexts 3 \
-  --pre-click '#reject-all-cookies'
+consent-audit fingerprint https://www.example.com
 # → reports/www.example.com.fingerprint.{json,md}
+
+# override either input if needed:
+consent-audit fingerprint https://www.example.com -c rvu_device_id --pre-click '#reject'
 ```
 
 ## Adding a site
 
-Create `sites/<host>.yaml`:
+Only needed when auto-detection reports a banner it cannot read (multi-layer reject,
+iframe-hosted CMP). Create `sites/<host>.yaml`:
 
 ```yaml
 url: https://example.com
@@ -115,7 +142,7 @@ The fingerprint test then answers the harder question: of the identifiers that s
 
 ## Limitations
 
-- Banner-button selectors are configured manually per site. There is no LLM-driven auto-detection yet; adding it is the obvious next iteration.
+- Auto-detection covers known CMPs and single-click reject-all banners. Multi-layer reject flows (Manage → toggle each off → Save) and iframe-hosted CMPs (Sourcepoint/Quantcast, TrustArc) are reported as inconclusive and still require a hand-written YAML.
 - Playwright Chromium fingerprints differently from a real user (`HeadlessChrome` substring in UA absent in headed mode, default screen size, etc.). Re-identification confidence on a hardened anti-fingerprint browser like Brave or Tor would differ.
 - The tool measures what fires *during a single visit*. Cross-session correlation (returning days later) requires additional infrastructure.
 - "Confidence the device is fingerprinted" depends on the cookie format being parseable. A nested `:id=<persistent>` with an explicit `confidenceScore` field makes detection trivial; other vendors hide the persistent component inside an opaque blob.
